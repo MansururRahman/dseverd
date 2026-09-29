@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A flat folder of standalone Python CLI scripts that screen, score and backtest Dhaka Stock Exchange (DSE) stocks. Every script is decision support: it prints a verdict and the numbers behind it. There is no package, no build, no test suite, no linter config, and no git repo. Output goes to stdout. A few scripts can also write CSVs (per-symbol OHLCV, `dse_claude_signals.csv`).
+A flat folder of standalone Python CLI scripts that screen, score and backtest Dhaka Stock Exchange (DSE) stocks. Every script is decision support: it prints a verdict and the numbers behind it. There is no build and no linter config, but there is now an offline pytest suite, a local git repo, and a `web/` FastAPI package layered on top of the same scripts. Output goes to stdout. A few scripts can also write CSVs (per-symbol OHLCV, `dse_claude_signals.csv`).
 
 ## Running
 
@@ -22,6 +22,23 @@ python dse_swing_signal.py ACMEPL --exit --entry 50 --stop 49 --target 51.5
 - Each module's docstring has its own usage block and design rationale. Read it before changing a script.
 - Runs hit the network live. They make one archive request per ticker and sleep `FETCH_DELAY_SECONDS` (3s) between tickers, so a full watchlist run takes minutes. To verify a change quickly, run a single ticker.
 - Run scripts from this directory. They import each other as sibling modules, and the hold pickers find `Debt to Equity Ratio.xlsx` by a relative `glob`.
+
+## Web UI
+
+`web/` is a FastAPI app over the same engines (shortlist funnel + swing entry/exit, dse_claude, uptrend, technical, gate strategy). Its dependencies live only in `web/requirements.txt`; the CLI scripts stay stdlib-only.
+
+```
+python -m pip install -r web/requirements.txt
+python -m uvicorn web.app:app --host 127.0.0.1 --port 8000   # from the repo root
+python -m pytest                                              # offline; fixtures in tests/fixtures/bars
+python -m pytest tests/test_api.py::test_swing_entry          # single test
+```
+
+- `dse_shortlist.run_shortlist()` returns the funnel as data and reports progress through `emit(event, data)`. `CliPrinter` is the emit target that prints the CLI report. The web layer runs it as a background job (`web/jobs.py`, one worker thread) that the page polls.
+- `tests/legacy_shortlist.py` is a **frozen** copy of the pre-refactor script. `tests/test_shortlist_equivalence.py` asserts the CLI output is byte-identical to it. Never edit the legacy copy. If you change shortlist output on purpose, update the legacy copy in the same change and say so.
+- `web/cache.py` caches bars per (symbol, days) for the Dhaka day, with a 30-minute expiry, and throttles all archive fetches to `FETCH_DELAY_SECONDS`. This is why the shortlist job passes `delay=0`.
+- `dse_technical.merge_live_bar` mutates its list, so `web/services.py` always merges into a copy.
+- Refresh the recorded fixtures with `python -m tests.record_fixtures` (needs the network).
 
 ## Dependencies
 
