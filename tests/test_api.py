@@ -43,6 +43,14 @@ def test_index_serves_html(client):
     assert r.status_code == 200 and "<title>DSE Screener</title>" in r.text
 
 
+def test_ui_assets_are_served(client):
+    page = client.get("/").text
+    assert 'id="nav"' in page and "/app.js" in page and "/style.css" in page
+    js = client.get("/app.js")
+    assert js.status_code == 200 and "function renderJob" in js.text
+    assert client.get("/style.css").status_code == 200
+
+
 def test_watchlist_reads_the_xlsx(client):
     symbols = client.get("/api/watchlist").json()["symbols"]
     assert sym() in symbols and len(symbols) >= len(fx.fixture_symbols())

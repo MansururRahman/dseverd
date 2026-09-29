@@ -1,3 +1,30 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>DSE Screener</title></head>
-<body><p>UI coming in Task 6.</p></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSE Screener</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<aside id="nav">
+  <h1>DSE</h1>
+  <div class="group">Shortlist</div>
+  <button type="button" data-view="shortlist">Funnel</button>
+  <div class="group">Single stock</div>
+  <button type="button" data-view="swing_entry">Swing entry</button>
+  <button type="button" data-view="swing_exit">Swing exit</button>
+  <button type="button" data-view="claude">dse_claude</button>
+  <button type="button" data-view="uptrend">Uptrend</button>
+  <button type="button" data-view="technical">Technical</button>
+  <button type="button" data-view="gate">Gate strategy</button>
+  <p class="foot">Decision support only — not investment advice.</p>
+</aside>
+<main>
+  <form id="form" autocomplete="off"></form>
+  <section id="out"></section>
+</main>
+<datalist id="watchlist"></datalist>
+<script src="/app.js"></script>
+</body>
+</html>
