@@ -430,7 +430,7 @@ function renderJob(job) {
   }
   if (job.status === "done" && st2) parts.push(h("p", { class: "note" },
     "Stage-2 backtests use automated gates only (manual confirmations assumed) — an optimistic upper bound."));
-  document.getElementById("out").replaceChildren(...parts);
+  document.getElementById("out").replaceChildren(...parts.filter(p => p != null));
 }
 
 // ------------------------------------------------------------------- nav --
