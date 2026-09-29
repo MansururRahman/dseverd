@@ -150,7 +150,7 @@ function renderSwingExit(r) {
 }
 function renderClaude(r) {
   const kv = r.tradeable ? { Uptrend: r.uptrend, RR: num(r.rr), Entry: num(r.entry),
-    Exit: r.exit, Stop: num(r.stop) } : {};
+    Exit: num(r.exit), Stop: num(r.stop) } : {};
   return h("div", {},
     card(r.tradeable ? "TRADEABLE" : "NOT TRADEABLE", kv, r.reason),
     gateTable((r.ledger || []).map(l => {
