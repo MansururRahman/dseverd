@@ -64,6 +64,7 @@ tr.hl { background: var(--good-bg); }
 .gates td.icon { width: 24px; }
 .gates tr.pass td.icon { color: var(--good); }
 .gates tr.fail td.icon { color: var(--bad); }
+.gates tr.info td.icon { color: var(--muted); }
 .gates td.detail { font-family: var(--mono); color: var(--muted); }
 .error { background: var(--bad-bg); color: var(--bad); padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
 .note { color: var(--warn); }

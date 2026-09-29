@@ -66,10 +66,13 @@ function card(decision, kvs, sub) {
 }
 function gateTable(rows, title = "Gates") {
   return h("div", {}, h("h3", {}, title),
-    h("table", { class: "gates" }, h("tbody", {}, rows.map(g =>
-      h("tr", { class: g.ok ? "pass" : "fail" },
-        h("td", { class: "icon" }, g.ok ? "✔" : "✘"), h("td", {}, g.name),
-        h("td", { class: "detail" }, g.detail || ""))))));
+    h("table", { class: "gates" }, h("tbody", {}, rows.map(g => {
+      const trClass = g.ok === null ? "info" : (g.ok ? "pass" : "fail");
+      const icon = g.ok === null ? "•" : (g.ok ? "✔" : "✘");
+      return h("tr", { class: trClass },
+        h("td", { class: "icon" }, icon), h("td", {}, g.name),
+        h("td", { class: "detail" }, g.detail || ""));
+    }))));
 }
 const boolGates = obj => Object.entries(obj || {}).map(([name, ok]) => ({ name, ok }));
 function kvBlock(obj, title) {
@@ -147,10 +150,24 @@ function renderSwingExit(r) {
 }
 function renderClaude(r) {
   const kv = r.tradeable ? { Uptrend: r.uptrend, RR: num(r.rr), Entry: num(r.entry),
-    Exit: num(r.exit), Stop: num(r.stop) } : {};
+    Exit: r.exit, Stop: num(r.stop) } : {};
   return h("div", {},
     card(r.tradeable ? "TRADEABLE" : "NOT TRADEABLE", kv, r.reason),
-    gateTable((r.ledger || []).map(l => ({ ok: l.startsWith("PASS"), name: l.replace(/^(PASS|FAIL)\s+/, "") })), "Ledger"));
+    gateTable((r.ledger || []).map(l => {
+      let ok = null;
+      let name = l;
+      if (l.startsWith("PASS")) {
+        ok = true;
+        name = l.replace(/^PASS\s+/, "");
+      } else if (l.startsWith("FAIL")) {
+        ok = false;
+        name = l.replace(/^FAIL\s+/, "");
+      } else if (l.startsWith("INFO")) {
+        ok = null;
+        name = l.replace(/^INFO\s+/, "");
+      }
+      return { ok, name };
+    }), "Ledger"));
 }
 function renderUptrend(r) {
   if (r.decision === "NO DATA") return card(r.decision, {}, r.reason);
@@ -199,7 +216,8 @@ const TOOLS = {
   shortlist: { title: "Shortlist funnel", path: "/api/shortlist", fields: [
     { name: "source", label: "Tickers", type: "source" }, DAYS, LIVE,
     { name: "raw_volume", label: "Raw volume (no projection)", type: "checkbox" },
-    CAPITAL, RISK, SCORE, MIN_TURNOVER, INDEX] },
+    { ...MIN_TURNOVER, adv: false }, { ...INDEX, adv: false },
+    CAPITAL, RISK, SCORE] },
   swing_entry: { title: "Swing entry", path: "/api/swing/entry", render: renderSwingEntry, fields: [
     SYMBOL, DAYS, { name: "backtest", label: "Include backtest", type: "checkbox" },
     CAPITAL, RISK, { name: "min_rr", label: "Min RR (0 = off)", type: "number", adv: true }, SCORE] },
