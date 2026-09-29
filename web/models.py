@@ -69,7 +69,7 @@ class GateRequest(BaseModel):
 
 
 class ShortlistRequest(BaseModel):
-    symbols: list[Symbol] = []
+    symbols: Annotated[list[Symbol], Field(max_length=500)] = []
     use_watchlist: bool = False
     days: Days = 730
     live: bool = True

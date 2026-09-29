@@ -138,7 +138,12 @@ def gate_strategy(cache, symbol, days, capital, tp, stop_mult, cost, rsi_min, rs
     snap = gate.gate_snapshot(bars, cfg)
     label, reason = gate.strategy_verdict(snap, trades)
     window = f"{bars[0]['date']} -> {bars[-1]['date']}" if bars else "n/a"
+    note = None
+    if n_clean < cfg["sma_trend"] + cfg["macd_slow"]:
+        note = (f"WARNING: fewer than SMA{cfg['sma_trend']} + MACD warm-up days -- "
+                "trend gate may never arm; results thin")
     return _envelope(symbol, {"snapshot": snap, "trades": trades, "n_clean": n_clean,
                               "window": window, "verdict": label, "verdict_reason": reason,
                               "stats": trade_stats(trades),
-                              "summary_text": gate.summarize(trades, account=capital)})
+                              "summary_text": gate.summarize(trades, account=capital)},
+                     False, note)

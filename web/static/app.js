@@ -1,6 +1,7 @@
 "use strict";
 
-const state = { view: null, defaults: {}, watchlist: [], poll: null, pollToken: 0, shortlistDays: 730 };
+const state = { view: null, defaults: {}, watchlist: [], poll: null, pollToken: 0,
+  shortlistParams: {}, pendingNote: null };
 
 // ---------------------------------------------------------------- helpers --
 function h(tag, attrs = {}, ...kids) {
@@ -302,12 +303,15 @@ async function runTool(view) {
   clearInvalid();
   const out = document.getElementById("out");
   out.replaceChildren(h("p", { class: "muted" }, "Fetching from DSE…"));
+  const pendingNote = state.pendingNote;
+  state.pendingNote = null;  // one-shot: only the run it was set for shows it
   try {
     const data = await api(TOOLS[view].path, readForm(view));
     if (state.view !== view) return;
     out.replaceChildren(
       h("div", { class: "head" }, h("strong", {}, data.symbol), h("span", { class: "muted" }, data.fetched_at),
         data.live_merged ? h("span", { class: "chip warn" }, "LIVE (provisional)") : null),
+      pendingNote ? h("p", { class: "note" }, pendingNote) : null,
       data.note ? h("p", { class: "note" }, data.note) : null,
       TOOLS[view].render(data.result));
   } catch (err) { showError(err); }
@@ -325,10 +329,23 @@ async function startShortlist() {
 function pollJob(id) {
   const token = ++state.pollToken;
   clearTimeout(state.poll);
+  let errors = 0;
+  const MAX_RETRIES = 3;
   const tick = async () => {
     if (token !== state.pollToken) return;
     let job;
-    try { job = await api(`/api/jobs/${id}`); } catch (err) { showError(err); return; }
+    try {
+      job = await api(`/api/jobs/${id}`);
+    } catch (err) {
+      errors++;
+      if (errors > MAX_RETRIES) {
+        if (state.view === "shortlist") showError(err);
+        return;
+      }
+      state.poll = setTimeout(tick, 1000);  // transient failure -- retry, same interval
+      return;
+    }
+    errors = 0;
     if (token !== state.pollToken) return;
     if (state.view === "shortlist") renderJob(job);
     if (job.status === "queued" || job.status === "running") state.poll = setTimeout(tick, 1000);
@@ -339,7 +356,15 @@ function openSwing(row) {
   showView("swing_entry");
   const form = document.getElementById("form");
   form.elements.symbol.value = row.symbol;
-  form.elements.days.value = state.shortlistDays;
+  const p = state.shortlistParams || {};
+  if (p.days !== undefined) form.elements.days.value = p.days;
+  if (p.capital !== undefined && form.elements.capital) form.elements.capital.value = p.capital;
+  if (p.risk !== undefined && form.elements.risk) form.elements.risk.value = p.risk;
+  if (p.score_gate !== undefined && form.elements.score_gate) form.elements.score_gate.value = p.score_gate;
+  if (row.src === "LIVE") {
+    state.pendingNote = "Stage 1 used today's provisional live bar; Swing entry is "
+      + "archive-only (last close), so its verdict can differ.";
+  }
   runTool("swing_entry");
 }
 function renderJob(job) {
@@ -347,7 +372,7 @@ function renderJob(job) {
   const st1 = res.stage1 || p.stage1, st2 = res.stage2 || p.stage2, st3 = res.stage3 || p.stage3;
   const st4 = res.stage4 || p.stage4, live = res.live || p.live, pr = job.progress;
   const running = job.status === "queued" || job.status === "running";
-  state.shortlistDays = job.params?.days ?? 730;
+  state.shortlistParams = job.params || {};
   const parts = [h("div", { class: "jobbar" }, chip(job.status.toUpperCase()),
     pr && running ? h("span", {}, `Stage ${pr.stage} · ${pr.i + 1}/${pr.n} · ${pr.symbol}`) : null,
     pr && running ? h("progress", { max: pr.n, value: pr.i + 1 }) : null,

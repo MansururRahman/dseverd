@@ -159,6 +159,15 @@ def test_gate_rejects_unknown_gate(client):
     assert r.status_code == 422
 
 
+def test_gate_warns_on_thin_history():
+    short_bars = fx.load_bars(sym())[-100:]
+    c = TestClient(create_app(cache=make_cache(fetch=lambda s, start, end: short_bars)))
+    j = c.post("/api/gate", json={"symbol": sym()}).json()
+    assert j["result"]["n_clean"] < 226
+    assert j["note"] == ("WARNING: fewer than SMA200 + MACD warm-up days -- "
+                         "trend gate may never arm; results thin")
+
+
 @pytest.mark.parametrize("path", ["/api/swing/entry", "/api/claude", "/api/uptrend",
                                   "/api/technical", "/api/gate"])
 def test_fetch_failure_is_502(client, path):
@@ -197,6 +206,11 @@ def test_shortlist_needs_tickers(client, cache, tmp_path):
     assert client.post("/api/shortlist", json={}).status_code == 422
     c = TestClient(create_app(cache=cache, watchlist_path=tmp_path / "none.xlsx"))
     assert c.post("/api/shortlist", json={"use_watchlist": True}).status_code == 422
+
+
+def test_shortlist_rejects_too_many_symbols(client):
+    r = client.post("/api/shortlist", json={"symbols": [f"S{i}" for i in range(501)]})
+    assert r.status_code == 422
 
 
 def test_unknown_jobs_are_404(client):

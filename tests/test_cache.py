@@ -102,6 +102,19 @@ def test_fetch_errors_are_not_cached():
     assert cache.bars("A", 730) == [{"close": 1.0}]
 
 
+def test_empty_results_are_not_cached():
+    calls = []
+
+    def sometimes_empty(symbol, start, end):
+        calls.append(symbol)
+        return [] if len(calls) == 1 else [{"close": 1.0}]
+
+    cache = BarCache(fetch=sometimes_empty, min_interval=0)
+    assert cache.bars("A", 730) == []
+    assert cache.bars("A", 730) == [{"close": 1.0}]
+    assert len(calls) == 2
+
+
 def test_live_snapshot_cached_for_ttl(env):
     env.cache.live_snapshot()
     env.clock.t += 299

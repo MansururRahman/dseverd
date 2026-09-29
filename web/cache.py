@@ -53,8 +53,9 @@ class BarCache:
         start = end - dt.timedelta(days=key[1])
         fetch = self._fetch or dse_technical.fetch_history
         bars = self._throttled(fetch, key[0], start, end)
-        with self._lock:
-            self._bars[key] = (self.today(), self.clock(), bars)
+        if bars:  # don't cache an empty result -- let the next call retry a hiccup
+            with self._lock:
+                self._bars[key] = (self.today(), self.clock(), bars)
         return list(bars)
 
     def live_snapshot(self) -> tuple[dict, dt.date | None]:

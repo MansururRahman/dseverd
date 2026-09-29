@@ -74,7 +74,9 @@ Stages 2 and 4 must never see the partial live bar, so the archive list and the 
 ## Variants and duplicates
 
 Scripts with a `_strict`, `_no_false_positive`, `_nolive`, `_intraday` or `_Bak` suffix are forked snapshots of an earlier version. They are not imported by anything. Edit the unsuffixed file unless the user names a variant. Current state:
-- `dse_shortlist.py` is byte-identical to `dse_shortlist_intraday.py`. The intraday version was copied over the base, which is why its docstring still refers to `dse_shortlist.py` as "the other script".
+- `dse_shortlist.py` started as a copy of `dse_shortlist_intraday.py` and has since been refactored into `run_shortlist()` + `CliPrinter` for the web UI.
+- `_intraday` is the pre-refactor snapshot.
+- Never copy either file over the other.
 - `dse_shortlist_Bak.py` is identical to `dse_shortlist_nolive.py`, the pre-live EOD-only version.
 
 ## Conventions in this code
