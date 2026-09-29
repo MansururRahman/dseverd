@@ -263,4 +263,6 @@ setInterval(function () {
     }, 14000);*/
 }, 540000)
 
+python -m uvicorn web.app:app --host 127.0.0.1 --port 8000
+
 '''
