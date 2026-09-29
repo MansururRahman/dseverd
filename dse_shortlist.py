@@ -72,6 +72,7 @@ import argparse
 import datetime as dt
 import sys
 import time
+from dataclasses import asdict, dataclass
 
 import dse_claude
 import dse_gate_strategy as gate
@@ -229,17 +230,376 @@ def _expectancy(trades: list[dict]) -> tuple:
     return sum(rets) / len(rets), len(rets), win_rate
 
 
-def run_stage4(all_fetched: list[dict]) -> None:
+# --------------------------------------------------------------------------- #
+# Funnel: run_shortlist() returns every stage as data and reports progress via
+# emit(event, data). CliPrinter turns the events into the CLI report; the web UI
+# turns them into job progress. An exception raised by emit aborts the run.
+#
+#   live           {enabled, n_tickers, session_date, error}
+#   stage1_start   {n, delay}           ticker        {stage, i, n, symbol}
+#   stage1_row     one screen row       stage1_done   {rows, n_screened, n_passed,
+#                                                      n_skipped, n_live, notes}
+#   stage2_start   {n}                  stage2_row / stage2_done  {rows, robust}
+#   stage3_start   {n}                  stage3_done   {n_robust, rows, results,
+#                                                      confirmed, warning}
+#   stage4_start   {n}                  stage4_done   {rows}
+#   done           the full result dict
+# --------------------------------------------------------------------------- #
+@dataclass
+class ShortlistOptions:
+    """The funnel's knobs -- one field per CLI flag (the ticker list aside)."""
+    days: int = 730
+    capital: float = swing.DEFAULTS["capital"]
+    risk: float = swing.DEFAULTS["risk_pct"]
+    score_gate: int = swing.DEFAULTS["score_gate"]
+    min_turnover: float | None = None
+    index_symbol: str | None = None
+    no_live: bool = False
+    raw_volume: bool = False
+
+
+def _no_emit(event: str, data) -> None:
+    pass
+
+
+def _stage1_notes(n_live: int, opts: ShortlistOptions, session_date: dt.date | None,
+                  end: dt.date) -> list[str]:
+    """The explanatory lines under the stage-1 table (wording unchanged)."""
+    notes: list[str] = []
+    # An all-EOD run mid-morning is the early-session refusal, not a bug. Say so.
+    if not n_live and not opts.no_live and session_date == end:
+        frac_now = session_elapsed_fraction()
+        if 0.0 < frac_now < MIN_PRORATE_FRACTION:
+            notes.append(f"  NOTE: {frac_now:.0%} of the session elapsed, below the "
+                         f"{MIN_PRORATE_FRACTION:.0%} needed to project volume")
+            notes.append(f"  (x{1 / frac_now:.1f} uplift would let the uniformity assumption "
+                         "dominate). Screening yesterday's close")
+            notes.append("  instead. Re-run after ~12:10 Asia/Dhaka, or pass --raw-volume to "
+                         "use partial volume as-is.")
+        elif frac_now <= 0.0:
+            notes.append("  NOTE: session has not opened (or has no volume yet) -- screening "
+                         "the last completed session.")
+    if n_live:
+        frac = session_elapsed_fraction()
+        notes.append(f"  LIVE = archive history + today's ({session_date}) live bar. Its OPEN is "
+                     f"SYNTHESIZED as the prior close.")
+        if opts.raw_volume:
+            notes.append(f"  VOLUME is RAW session-to-date ({frac:.0%} of the session elapsed) "
+                         "compared against a 20-day average of")
+            notes.append("  COMPLETE sessions -- this biases PULLBACK setups toward a false PASS. "
+                         "Drop --raw-volume to project it.")
+        else:
+            notes.append(f"  VOLUME is PROJECTED to a full day: session-to-date / {frac:.2f} "
+                         f"elapsed = x{1 / frac:.2f} uplift, so it is")
+            notes.append("  comparable with the 20-day average of complete sessions. That assumes "
+                         "volume accrues uniformly;")
+            notes.append("  DSE's open and close are heavier, so the projection tends to run HIGH. "
+                         "A MODEL ESTIMATE, not an")
+            notes.append("  observation -- volume-dependent gates carry more uncertainty than the "
+                         "price/trend gates.")
+        notes.append("  HIGH/LOW are also partial -- prices, gates and sizing are PROVISIONAL "
+                     "until the close.")
+    return notes
+
+
+def _run_stage4(all_fetched: list[dict], emit) -> dict:
     """STAGE 4: dse_claude pullback signal across EVERY fetched ticker (EOD bars).
 
     Reads the archive-only list on purpose -- dse_claude has its own live handling
     and this stage is deliberately left as it is in dse_shortlist.py.
     """
-    print(f"\n{'=' * 84}\nSTAGE 4 -- DSE_CLAUDE PULLBACK SIGNAL ON ALL "
-          f"{len(all_fetched)} FETCHED TICKER(S)  [EOD bars]\n{'=' * 84}")
-    cc_results = [dse_claude.evaluate(it["symbol"], it["bars"], live=False)
-                  for it in all_fetched]
-    dse_claude.print_table(cc_results)
+    emit("stage4_start", {"n": len(all_fetched)})
+    stage4 = {"rows": [dse_claude.evaluate(it["symbol"], it["bars"], live=False)
+                       for it in all_fetched]}
+    emit("stage4_done", stage4)
+    return stage4
+
+
+def run_shortlist(symbols: list[str], opts: ShortlistOptions, emit=None,
+                  fetch=None, fetch_live=None, delay: float | None = None) -> dict:
+    """Run the four-stage funnel over `symbols` and return every stage as data.
+
+    Progress goes to `emit(event, data)` (events listed above). `fetch` and
+    `fetch_live` default to the DSE archive and live page; `delay` defaults to
+    FETCH_DELAY_SECONDS between ticker fetches.
+    """
+    emit = emit or _no_emit
+    fetch = fetch or fetch_history
+    fetch_live = fetch_live or fetch_live_snapshot
+    delay = FETCH_DELAY_SECONDS if delay is None else delay
+
+    # Swing params (stage 1 + swing backtest) and gate cfg (gate backtest).
+    p = dict(swing.DEFAULTS)
+    p["capital"] = opts.capital
+    p["risk_pct"] = opts.risk
+    p["score_gate"] = opts.score_gate
+    cfg = dict(gate.DEFAULT_CFG)
+
+    end = dt.date.today()
+    start = end - dt.timedelta(days=opts.days)
+    result: dict = {"symbols": list(symbols), "options": asdict(opts), "live": None,
+                    "stage1": None, "stage2": None, "stage3": None, "stage4": None}
+
+    # --------------------------------------------------------------------- #
+    # LIVE SNAPSHOT: one request up front returns every listed ticker, so all
+    # names share a single consistent timestamp and there is no per-ticker cost.
+    # A failure here is non-fatal -- fall back to archive-only.
+    # --------------------------------------------------------------------- #
+    live_snapshot: dict[str, dict] = {}
+    session_date: dt.date | None = None
+    live = {"enabled": not opts.no_live, "n_tickers": 0, "session_date": None, "error": None}
+    if not opts.no_live:
+        try:
+            live_snapshot, session_date = fetch_live()
+            live["n_tickers"], live["session_date"] = len(live_snapshot), session_date
+        except Exception as exc:  # noqa: BLE001
+            live["error"] = str(exc)
+    result["live"] = live
+    emit("live", live)
+
+    # --------------------------------------------------------------------- #
+    # STAGE 1: swing screen on archive + live bar. Fetch each ticker once
+    # (~3s polite delay between); cache BOTH bar lists for the later stages.
+    # --------------------------------------------------------------------- #
+    emit("stage1_start", {"n": len(symbols), "delay": delay})
+    rows: list[dict] = []
+    passed: list[dict] = []       # survivors: {symbol, bars, live_bars, live, res}
+    all_fetched: list[dict] = []  # every ticker with data: {symbol, bars} (stage 4)
+    n_screened = n_skipped = n_live = 0
+
+    def add_row(row: dict) -> None:
+        rows.append(row)
+        emit("stage1_row", row)
+
+    for i, sym in enumerate(symbols):
+        emit("ticker", {"stage": 1, "i": i, "n": len(symbols), "symbol": sym})
+        if i > 0:
+            time.sleep(delay)
+        try:
+            bars = fetch(sym, start, end)
+        except Exception as exc:  # noqa: BLE001
+            add_row({"symbol": sym, "src": "-", "decision": "NO DATA",
+                     "reason": f"fetch failed ({exc})"})
+            n_skipped += 1
+            continue
+        if not bars:
+            add_row({"symbol": sym, "src": "-", "decision": "NO DATA",
+                     "reason": "no data returned"})
+            n_skipped += 1
+            continue
+
+        # bars      = archive only  -> stages 2 and 4
+        # live_bars = archive + today -> stages 1 and 3
+        live_bars, merged = merge_live_bar_synth(bars, live_snapshot.get(sym), session_date,
+                                                 prorate_volume=not opts.raw_volume)
+        if merged:
+            n_live += 1
+        src = "LIVE" if merged else "EOD"
+
+        all_fetched.append({"symbol": sym, "bars": bars})  # cache for stage 4
+        res = swing.evaluate_entry(sym, live_bars, p)
+        n_screened += 1
+        if res["decision"] == "NO DATA":
+            add_row({"symbol": sym, "src": src, "decision": "NO DATA", "reason": res["reason"]})
+            n_skipped += 1
+            continue
+
+        s, z = res["snapshot"], res["sizing"]
+        add_row({"symbol": sym, "src": src, "decision": res["decision"], "setup": res["setup"],
+                 "price": s["price"], "rsi": s["rsi"],
+                 "gates_passed": sum(1 for g in res["gates"] if g["ok"]),
+                 "gates_total": len(res["gates"]),
+                 "rr": z["rr"] if z else None,
+                 "blocker": "" if res["decision"] == "CONDITIONAL BUY" else (res["reason"] or ""),
+                 "result": res})
+        if res["decision"] == "CONDITIONAL BUY":
+            passed.append({"symbol": sym, "bars": bars, "live_bars": live_bars,
+                           "live": merged, "res": res})
+
+    result["stage1"] = {"rows": rows, "n_screened": n_screened, "n_passed": len(passed),
+                        "n_skipped": n_skipped, "n_live": n_live,
+                        "notes": _stage1_notes(n_live, opts, session_date, end)}
+    emit("stage1_done", result["stage1"])
+
+    if not passed:
+        result["stage4"] = _run_stage4(all_fetched, emit)  # stage 4 reads the whole watchlist regardless
+        emit("done", result)
+        return result
+
+    # --------------------------------------------------------------------- #
+    # STAGE 2: dual backtest on the ARCHIVE bars (no re-fetch, no live bar).
+    # A partially-formed session must never enter a trade simulation: its close
+    # is a moving LTP and its open is synthesized, both of which would feed
+    # run_backtest's entry fill and _full_exit_fill.
+    # --------------------------------------------------------------------- #
+    emit("stage2_start", {"n": len(passed)})
+    rows2: list[dict] = []
+    robust: list[str] = []
+    for i, item in enumerate(passed):
+        sym, bars = item["symbol"], item["bars"]
+        emit("ticker", {"stage": 2, "i": i, "n": len(passed), "symbol": sym})
+
+        sw = swing.run_backtest(sym, bars, p)
+        sw_exp, sw_n, sw_wr = _expectancy(sw.get("trades", []))
+
+        gt_trades, _ = gate.backtest(bars, cfg)
+        gt_exp, gt_n, gt_wr = _expectancy(gt_trades)
+
+        both_pos = (sw_exp is not None and sw_exp > 0 and gt_exp is not None and gt_exp > 0)
+        one_pos = (sw_exp is not None and sw_exp > 0) or (gt_exp is not None and gt_exp > 0)
+        verdict = "ROBUST (both +)" if both_pos else ("MIXED (one +)" if one_pos else "WEAK (neither +)")
+        if both_pos:
+            robust.append(sym)
+
+        row = {"symbol": sym, "swing_exp": sw_exp, "swing_wr": sw_wr, "swing_n": sw_n,
+               "gate_exp": gt_exp, "gate_wr": gt_wr, "gate_n": gt_n, "verdict": verdict}
+        rows2.append(row)
+        emit("stage2_row", row)
+    result["stage2"] = {"rows": rows2, "robust": robust}
+    emit("stage2_done", result["stage2"])
+
+    # --------------------------------------------------------------------- #
+    # STAGE 3: uptrend gate on the stage-2 ROBUST names, using the LIVE bars --
+    # like stage 1 this is a "today" structural read (MA/ADX/RSI/MACD).
+    # --------------------------------------------------------------------- #
+    emit("stage3_start", {"n": len(robust)})
+    stage3: dict = {"n_robust": len(robust), "rows": [], "results": [], "confirmed": [],
+                    "warning": None}
+    if robust:
+        # Optional market guard: fetch the index once (same for every ticker).
+        # Archive-only: the live page carries no index rows.
+        index_bars = None
+        if opts.index_symbol:
+            try:
+                index_bars = fetch(opts.index_symbol.upper(), start, end)
+                if not index_bars:
+                    stage3["warning"] = (f"warning: index {opts.index_symbol} returned no data -- "
+                                         "market guard disabled.")
+            except Exception as exc:  # noqa: BLE001
+                stage3["warning"] = (f"warning: index {opts.index_symbol} fetch failed ({exc}) -- "
+                                     "market guard disabled.")
+                index_bars = None
+
+        bars_by_sym = {item["symbol"]: item["live_bars"] for item in passed}
+        for sym in robust:
+            res = uptrend.evaluate_uptrend(sym, bars_by_sym[sym],
+                                           index_bars=index_bars,
+                                           min_avg_vol=opts.min_turnover)
+            stage3["results"].append(res)
+            stage3["rows"].append(uptrend.brief_row(res))
+            if res["decision"].startswith("TRADE"):
+                stage3["confirmed"].append(sym)
+    result["stage3"] = stage3
+    emit("stage3_done", stage3)
+
+    # STAGE 4: dse_claude pullback signal across EVERY fetched ticker (archive
+    # bars, no re-fetch) -- a whole-watchlist read, independent of stages 1-3.
+    result["stage4"] = _run_stage4(all_fetched, emit)
+    emit("done", result)
+    return result
+
+
+class CliPrinter:
+    """emit() target that prints the shortlist report exactly as the CLI always has."""
+
+    def __call__(self, event: str, data) -> None:
+        handler = getattr(self, f"_{event}", None)
+        if handler is not None:
+            handler(data)
+
+    def _live(self, live: dict) -> None:
+        if not live["enabled"]:
+            print("Live snapshot: DISABLED (--no-live) -- day-end archive only.")
+        elif live["error"] is not None:
+            print(f"live snapshot unavailable ({live['error']}); using archive only",
+                  file=sys.stderr)
+        else:
+            print(f"Live snapshot: {live['n_tickers']} tickers as of {live['session_date']}.")
+
+    def _stage1_start(self, d: dict) -> None:
+        print(f"\n{'=' * 84}\nSTAGE 1 -- SWING SCREEN ({d['n']} tickers, "
+              f"~{d['delay']}s/ticker)  [LIVE bars where available]\n{'=' * 84}")
+        print(f"{'SYMBOL':<12}{'SRC':<6}{'DECISION':<16}{'SETUP':<10}{'PRICE':>9}{'RSI':>6}"
+              f"{'GATES':>8}{'RR':>7}  BLOCKER")
+        print("-" * 84)
+
+    def _stage1_row(self, r: dict) -> None:
+        if r["decision"] == "NO DATA":
+            print(f"{r['symbol']:<12}{r['src']:<6}{'NO DATA':<16}{r['reason']}")
+            return
+        rr = f"{r['rr']:.2f}" if r["rr"] is not None else "-"
+        rsi_s = f"{r['rsi']:.0f}" if r["rsi"] is not None else "-"
+        gates = f"{r['gates_passed']}/{r['gates_total']}"
+        print(f"{r['symbol']:<12}{r['src']:<6}{r['decision']:<16}{r['setup']:<10}{r['price']:>9g}"
+              f"{rsi_s:>6}{gates:>8}{rr:>7}  {r['blocker']}")
+
+    def _stage1_done(self, d: dict) -> None:
+        print("-" * 84)
+        print(f"{d['n_screened']} screened, {d['n_passed']} CONDITIONAL BUY, "
+              f"{d['n_skipped']} skipped, {d['n_live']} on a LIVE bar.")
+        for line in d["notes"]:
+            print(line)
+        if not d["n_passed"]:
+            print("\nNo CONDITIONAL BUYs -- nothing to backtest in stages 2-3. "
+                  "(Swing gates on the latest bar; a low-volume session alone can block a name.)")
+
+    def _stage2_start(self, d: dict) -> None:
+        print(f"\n{'=' * 84}\nSTAGE 2 -- DUAL BACKTEST OF THE {d['n']} SURVIVOR(S)  "
+              f"[EOD bars]\n{'=' * 84}")
+        print(f"{'SYMBOL':<12}{'SWING_EXP':>10}{'SW_WR':>7}{'SW_N':>6}"
+              f"{'GATE_EXP':>10}{'GT_WR':>7}{'GT_N':>6}   VERDICT")
+        print("-" * 84)
+
+    def _stage2_row(self, r: dict) -> None:
+        sw_exp_s = f"{r['swing_exp']:+.2%}" if r["swing_exp"] is not None else "n/a"
+        gt_exp_s = f"{r['gate_exp']:+.2%}" if r["gate_exp"] is not None else "n/a"
+        print(f"{r['symbol']:<12}{sw_exp_s:>10}{r['swing_wr']:>6.0%}{r['swing_n']:>6}"
+              f"{gt_exp_s:>10}{r['gate_wr']:>6.0%}{r['gate_n']:>6}   {r['verdict']}")
+
+    def _stage2_done(self, d: dict) -> None:
+        print("-" * 84)
+        if d["robust"]:
+            print(f"ROBUST (positive expectancy in BOTH backtests): {', '.join(d['robust'])}")
+            print("  -> these are the CONDITIONAL BUYs that also backtested positive "
+                  "under two independent rulesets.")
+        else:
+            print("No survivor was positive in both backtests -- the setups pass the "
+                  "gates but lack a validated historical edge on these names.")
+
+    def _stage3_start(self, d: dict) -> None:
+        print(f"\n{'=' * 84}\nSTAGE 3 -- UPTREND GATE ON THE {d['n']} ROBUST NAME(S)  "
+              f"[LIVE bars where available]\n{'=' * 84}")
+
+    def _stage3_done(self, d: dict) -> None:
+        if not d["n_robust"]:
+            print("No ROBUST names from stage 2 -- nothing to run through the uptrend gate.")
+            return
+        if d["warning"]:
+            print(d["warning"], file=sys.stderr)
+        uptrend.print_brief_table(d["rows"])
+        if d["confirmed"]:
+            print(f"\nCONFIRMED (stage 1 + stage 2 + stage 3): {', '.join(d['confirmed'])}")
+            print("  -> CONDITIONAL BUYs that backtested positive under two "
+                  "rulesets AND currently pass the full uptrend gate.")
+        else:
+            print("\nNo ROBUST name currently passes the uptrend gate -- the backtested "
+                  "edge is there but the trend structure isn't confirmed.")
+
+    def _stage4_start(self, d: dict) -> None:
+        print(f"\n{'=' * 84}\nSTAGE 4 -- DSE_CLAUDE PULLBACK SIGNAL ON ALL "
+              f"{d['n']} FETCHED TICKER(S)  [EOD bars]\n{'=' * 84}")
+
+    def _stage4_done(self, d: dict) -> None:
+        dse_claude.print_table(d["rows"])
+
+    def _done(self, result: dict) -> None:
+        if result["stage2"] is None:
+            return  # the no-survivor path ends after stage 4 without the notes
+        print("\nNOTE: stage-2 backtests use AUTOMATED gates only (manual confirmations "
+              "assumed) -- an optimistic upper bound. Decision support, not advice.")
+        if result["stage1"]["n_live"]:
+            print("NOTE: stages 1 and 3 ran on a PROVISIONAL intraday bar. Re-run after the "
+                  "close to confirm on official prices.")
 
 
 def main(argv: list[str]) -> int:
@@ -273,13 +633,6 @@ def main(argv: list[str]) -> int:
                          "sessions, which biases pullbacks to a false PASS.")
     args = ap.parse_args(argv)
 
-    # Swing params (stage 1 + swing backtest) and gate cfg (gate backtest).
-    p = dict(swing.DEFAULTS)
-    p["capital"] = args.capital
-    p["risk_pct"] = args.risk
-    p["score_gate"] = args.score_gate
-    cfg = dict(gate.DEFAULT_CFG)
-
     # Assemble the watchlist: CLI codes first, then the xlsx list.
     symbols = [s.upper() for s in args.symbols]
     if args.from_xlsx:
@@ -297,219 +650,11 @@ def main(argv: list[str]) -> int:
     if not symbols:
         ap.error("no tickers given -- pass trading codes and/or --from-xlsx PATH")
 
-    end = dt.date.today()
-    start = end - dt.timedelta(days=args.days)
-
-    # --------------------------------------------------------------------- #
-    # LIVE SNAPSHOT: one request up front returns every listed ticker, so all
-    # names share a single consistent timestamp and there is no per-ticker cost.
-    # A failure here is non-fatal -- fall back to archive-only.
-    # --------------------------------------------------------------------- #
-    live_snapshot: dict[str, dict] = {}
-    session_date: dt.date | None = None
-    if args.no_live:
-        print("Live snapshot: DISABLED (--no-live) -- day-end archive only.")
-    else:
-        try:
-            live_snapshot, session_date = fetch_live_snapshot()
-            print(f"Live snapshot: {len(live_snapshot)} tickers as of {session_date}.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"live snapshot unavailable ({exc}); using archive only", file=sys.stderr)
-
-    # --------------------------------------------------------------------- #
-    # STAGE 1: swing screen on archive + live bar. Fetch each ticker once
-    # (~3s polite delay between); cache BOTH bar lists for the later stages.
-    # --------------------------------------------------------------------- #
-    print(f"\n{'=' * 84}\nSTAGE 1 -- SWING SCREEN ({len(symbols)} tickers, "
-          f"~{FETCH_DELAY_SECONDS}s/ticker)  [LIVE bars where available]\n{'=' * 84}")
-    print(f"{'SYMBOL':<12}{'SRC':<6}{'DECISION':<16}{'SETUP':<10}{'PRICE':>9}{'RSI':>6}"
-          f"{'GATES':>8}{'RR':>7}  BLOCKER")
-    print("-" * 84)
-
-    passed: list[dict] = []       # survivors: {symbol, bars, live_bars, live, res}
-    all_fetched: list[dict] = []  # every ticker with data: {symbol, bars} (stage 4)
-    n_screened = n_skipped = n_live = 0
-    for i, sym in enumerate(symbols):
-        if i > 0:
-            time.sleep(FETCH_DELAY_SECONDS)
-        try:
-            bars = fetch_history(sym, start, end)
-        except Exception as exc:  # noqa: BLE001
-            print(f"{sym:<12}{'-':<6}{'NO DATA':<16}fetch failed ({exc})")
-            n_skipped += 1
-            continue
-        if not bars:
-            print(f"{sym:<12}{'-':<6}{'NO DATA':<16}no data returned")
-            n_skipped += 1
-            continue
-
-        # bars      = archive only  -> stages 2 and 4
-        # live_bars = archive + today -> stages 1 and 3
-        live_bars, merged = merge_live_bar_synth(bars, live_snapshot.get(sym), session_date,
-                                                 prorate_volume=not args.raw_volume)
-        if merged:
-            n_live += 1
-        src = "LIVE" if merged else "EOD"
-
-        all_fetched.append({"symbol": sym, "bars": bars})  # cache for stage 4
-        res = swing.evaluate_entry(sym, live_bars, p)
-        n_screened += 1
-        if res["decision"] == "NO DATA":
-            print(f"{sym:<12}{src:<6}{'NO DATA':<16}{res['reason']}")
-            n_skipped += 1
-            continue
-
-        s, z = res["snapshot"], res["sizing"]
-        gates_passed = sum(1 for g in res["gates"] if g["ok"])
-        gates_total = len(res["gates"])
-        rr = f"{z['rr']:.2f}" if z and z["rr"] is not None else "-"
-        rsi_s = f"{s['rsi']:.0f}" if s["rsi"] is not None else "-"
-        blocker = "" if res["decision"] == "CONDITIONAL BUY" else (res["reason"] or "")
-        print(f"{sym:<12}{src:<6}{res['decision']:<16}{res['setup']:<10}{s['price']:>9g}"
-              f"{rsi_s:>6}{str(gates_passed) + '/' + str(gates_total):>8}{rr:>7}  {blocker}")
-
-        if res["decision"] == "CONDITIONAL BUY":
-            passed.append({"symbol": sym, "bars": bars, "live_bars": live_bars,
-                           "live": merged, "res": res})
-
-    print("-" * 84)
-    print(f"{n_screened} screened, {len(passed)} CONDITIONAL BUY, {n_skipped} skipped, "
-          f"{n_live} on a LIVE bar.")
-    # An all-EOD run mid-morning is the early-session refusal, not a bug. Say so.
-    if not n_live and not args.no_live and session_date == end:
-        frac_now = session_elapsed_fraction()
-        if 0.0 < frac_now < MIN_PRORATE_FRACTION:
-            print(f"  NOTE: {frac_now:.0%} of the session elapsed, below the "
-                  f"{MIN_PRORATE_FRACTION:.0%} needed to project volume")
-            print(f"  (x{1 / frac_now:.1f} uplift would let the uniformity assumption "
-                  "dominate). Screening yesterday's close")
-            print("  instead. Re-run after ~12:10 Asia/Dhaka, or pass --raw-volume to "
-                  "use partial volume as-is.")
-        elif frac_now <= 0.0:
-            print("  NOTE: session has not opened (or has no volume yet) -- screening "
-                  "the last completed session.")
-    if n_live:
-        frac = session_elapsed_fraction()
-        print(f"  LIVE = archive history + today's ({session_date}) live bar. Its OPEN is "
-              f"SYNTHESIZED as the prior close.")
-        if args.raw_volume:
-            print(f"  VOLUME is RAW session-to-date ({frac:.0%} of the session elapsed) "
-                  "compared against a 20-day average of")
-            print("  COMPLETE sessions -- this biases PULLBACK setups toward a false PASS. "
-                  "Drop --raw-volume to project it.")
-        else:
-            print(f"  VOLUME is PROJECTED to a full day: session-to-date / {frac:.2f} "
-                  f"elapsed = x{1 / frac:.2f} uplift, so it is")
-            print("  comparable with the 20-day average of complete sessions. That assumes "
-                  "volume accrues uniformly;")
-            print("  DSE's open and close are heavier, so the projection tends to run HIGH. "
-                  "A MODEL ESTIMATE, not an")
-            print("  observation -- volume-dependent gates carry more uncertainty than the "
-                  "price/trend gates.")
-        print("  HIGH/LOW are also partial -- prices, gates and sizing are PROVISIONAL "
-              "until the close.")
-
-    if not passed:
-        print("\nNo CONDITIONAL BUYs -- nothing to backtest in stages 2-3. "
-              "(Swing gates on the latest bar; a low-volume session alone can block a name.)")
-        run_stage4(all_fetched)  # stage 4 reads the whole watchlist regardless
-        return 0
-
-    # --------------------------------------------------------------------- #
-    # STAGE 2: dual backtest on the ARCHIVE bars (no re-fetch, no live bar).
-    # A partially-formed session must never enter a trade simulation: its close
-    # is a moving LTP and its open is synthesized, both of which would feed
-    # run_backtest's entry fill and _full_exit_fill.
-    # --------------------------------------------------------------------- #
-    print(f"\n{'=' * 84}\nSTAGE 2 -- DUAL BACKTEST OF THE {len(passed)} SURVIVOR(S)  "
-          f"[EOD bars]\n{'=' * 84}")
-    print(f"{'SYMBOL':<12}{'SWING_EXP':>10}{'SW_WR':>7}{'SW_N':>6}"
-          f"{'GATE_EXP':>10}{'GT_WR':>7}{'GT_N':>6}   VERDICT")
-    print("-" * 84)
-
-    robust: list[str] = []
-    for item in passed:
-        sym, bars = item["symbol"], item["bars"]
-
-        sw = swing.run_backtest(sym, bars, p)
-        sw_trades = sw.get("trades", [])
-        sw_exp, sw_n, sw_wr = _expectancy(sw_trades)
-
-        gt_trades, _ = gate.backtest(bars, cfg)
-        gt_exp, gt_n, gt_wr = _expectancy(gt_trades)
-
-        both_pos = (sw_exp is not None and sw_exp > 0 and gt_exp is not None and gt_exp > 0)
-        one_pos = (sw_exp is not None and sw_exp > 0) or (gt_exp is not None and gt_exp > 0)
-        verdict = "ROBUST (both +)" if both_pos else ("MIXED (one +)" if one_pos else "WEAK (neither +)")
-        if both_pos:
-            robust.append(sym)
-
-        sw_exp_s = f"{sw_exp:+.2%}" if sw_exp is not None else "n/a"
-        gt_exp_s = f"{gt_exp:+.2%}" if gt_exp is not None else "n/a"
-        print(f"{sym:<12}{sw_exp_s:>10}{sw_wr:>6.0%}{sw_n:>6}"
-              f"{gt_exp_s:>10}{gt_wr:>6.0%}{gt_n:>6}   {verdict}")
-
-    print("-" * 84)
-    if robust:
-        print(f"ROBUST (positive expectancy in BOTH backtests): {', '.join(robust)}")
-        print("  -> these are the CONDITIONAL BUYs that also backtested positive "
-              "under two independent rulesets.")
-    else:
-        print("No survivor was positive in both backtests -- the setups pass the "
-              "gates but lack a validated historical edge on these names.")
-
-    # --------------------------------------------------------------------- #
-    # STAGE 3: uptrend gate on the stage-2 ROBUST names, using the LIVE bars --
-    # like stage 1 this is a "today" structural read (MA/ADX/RSI/MACD).
-    # --------------------------------------------------------------------- #
-    print(f"\n{'=' * 84}\nSTAGE 3 -- UPTREND GATE ON THE {len(robust)} ROBUST NAME(S)  "
-          f"[LIVE bars where available]\n{'=' * 84}")
-    if not robust:
-        print("No ROBUST names from stage 2 -- nothing to run through the uptrend gate.")
-    else:
-        # Optional market guard: fetch the index once (same for every ticker).
-        # Archive-only: the live page carries no index rows.
-        index_bars = None
-        if args.index_symbol:
-            try:
-                index_bars = fetch_history(args.index_symbol.upper(), start, end)
-                if not index_bars:
-                    print(f"warning: index {args.index_symbol} returned no data -- "
-                          "market guard disabled.", file=sys.stderr)
-            except Exception as exc:  # noqa: BLE001
-                print(f"warning: index {args.index_symbol} fetch failed ({exc}) -- "
-                      "market guard disabled.", file=sys.stderr)
-                index_bars = None
-
-        bars_by_sym = {item["symbol"]: item["live_bars"] for item in passed}
-        stage3_rows: list[dict] = []
-        confirmed: list[str] = []
-        for sym in robust:
-            res = uptrend.evaluate_uptrend(sym, bars_by_sym[sym],
-                                           index_bars=index_bars,
-                                           min_avg_vol=args.min_turnover)
-            stage3_rows.append(uptrend.brief_row(res))
-            if res["decision"].startswith("TRADE"):
-                confirmed.append(sym)
-        uptrend.print_brief_table(stage3_rows)
-
-        if confirmed:
-            print(f"\nCONFIRMED (stage 1 + stage 2 + stage 3): {', '.join(confirmed)}")
-            print("  -> CONDITIONAL BUYs that backtested positive under two "
-                  "rulesets AND currently pass the full uptrend gate.")
-        else:
-            print("\nNo ROBUST name currently passes the uptrend gate -- the backtested "
-                  "edge is there but the trend structure isn't confirmed.")
-
-    # STAGE 4: dse_claude pullback signal across EVERY fetched ticker (archive
-    # bars, no re-fetch) -- a whole-watchlist read, independent of stages 1-3.
-    run_stage4(all_fetched)
-
-    print("\nNOTE: stage-2 backtests use AUTOMATED gates only (manual confirmations "
-          "assumed) -- an optimistic upper bound. Decision support, not advice.")
-    if n_live:
-        print("NOTE: stages 1 and 3 ran on a PROVISIONAL intraday bar. Re-run after the "
-              "close to confirm on official prices.")
+    opts = ShortlistOptions(days=args.days, capital=args.capital, risk=args.risk,
+                            score_gate=args.score_gate, min_turnover=args.min_turnover,
+                            index_symbol=args.index_symbol, no_live=args.no_live,
+                            raw_volume=args.raw_volume)
+    run_shortlist(symbols, opts, emit=CliPrinter())
     return 0
 
 
